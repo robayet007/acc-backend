@@ -2,6 +2,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const path = require('path');
+const multer = require('multer');
+const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
@@ -10,6 +12,29 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Ensure uploads directory exists
+if (!fs.existsSync('uploads')) {
+  fs.mkdirSync('uploads');
+}
+
+// Multer Configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'image-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  }
+});
 
 // MongoDB Connection
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/accounting-notes', {
@@ -35,30 +60,38 @@ const Note = mongoose.model('Note', NoteSchema);
 app.get('/api/notes', async (req, res) => {
   try {
     const notes = await Note.find().sort({ createdAt: -1 });
-    res.json(notes);
+    
+    // Add full URL to images
+    const notesWithFullUrls = notes.map(note => ({
+      ...note._doc,
+      images: note.images.map(img => {
+        if (img.startsWith('http')) {
+          return img;
+        }
+        return `${req.protocol}://${req.get('host')}${img}`;
+      })
+    }));
+    
+    res.json(notesWithFullUrls);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// Get notes by chapter and paper
-app.get('/api/notes/:paper/:chapterId', async (req, res) => {
+// Create new note - UPDATED WITH MULTER
+app.post('/api/notes', upload.array('images', 10), async (req, res) => {
   try {
-    const { paper, chapterId } = req.params;
-    const notes = await Note.find({ 
-      paper, 
-      chapterId: parseInt(chapterId) 
-    }).sort({ createdAt: -1 });
-    res.json(notes);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// Create new note
-app.post('/api/notes', async (req, res) => {
-  try {
-    const { title, authorName, paper, chapterId, images } = req.body;
+    const { title, authorName, paper, chapterId } = req.body;
+    
+    console.log('Received files:', req.files);
+    console.log('Received body:', req.body);
+    
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ message: 'No images uploaded' });
+    }
+    
+    // Get uploaded file paths
+    const images = req.files.map(file => `/uploads/${file.filename}`);
     
     const newNote = new Note({
       title,
@@ -70,29 +103,72 @@ app.post('/api/notes', async (req, res) => {
     });
 
     const savedNote = await newNote.save();
-    res.status(201).json(savedNote);
+    
+    // Add full URLs to response
+    const responseNote = {
+      ...savedNote._doc,
+      images: savedNote.images.map(img => `${req.protocol}://${req.get('host')}${img}`)
+    };
+    
+    res.status(201).json(responseNote);
   } catch (error) {
+    console.error('Error creating note:', error);
     res.status(400).json({ message: error.message });
   }
 });
 
-// Delete note
+// Other routes remain the same...
+app.get('/api/notes/:paper/:chapterId', async (req, res) => {
+  try {
+    const { paper, chapterId } = req.params;
+    const notes = await Note.find({ 
+      paper, 
+      chapterId: parseInt(chapterId) 
+    }).sort({ createdAt: -1 });
+    
+    const notesWithFullUrls = notes.map(note => ({
+      ...note._doc,
+      images: note.images.map(img => {
+        if (img.startsWith('http')) {
+          return img;
+        }
+        return `${req.protocol}://${req.get('host')}${img}`;
+      })
+    }));
+    
+    res.json(notesWithFullUrls);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 app.delete('/api/notes/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const deletedNote = await Note.findByIdAndDelete(id);
+    const note = await Note.findById(id);
     
-    if (!deletedNote) {
+    if (!note) {
       return res.status(404).json({ message: 'Note not found' });
     }
     
+    // Delete associated image files
+    note.images.forEach(imagePath => {
+      const filename = path.basename(imagePath);
+      const filePath = path.join(__dirname, 'uploads', filename);
+      
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    });
+    
+    await Note.findByIdAndDelete(id);
     res.json({ message: 'Note deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// Get chapters (you can expand this later)
+// Get chapters route...
 app.get('/api/chapters/:paper', (req, res) => {
   const { paper } = req.params;
   
